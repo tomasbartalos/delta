@@ -24,6 +24,7 @@ import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.Utils
+import DeltaConfigs.ENABLE_CONCURRENT_PARTITIONS_WRITE
 
 class OptimisticTransactionSuite extends QueryTest with SharedSQLContext {
   private val addA = AddFile("a", Map.empty, 1, 1, dataChange = true)
@@ -92,6 +93,51 @@ class OptimisticTransactionSuite extends QueryTest with SharedSQLContext {
       txn.commit(addA.remove :: addB :: Nil, Truncate())
       checkAnswer(log.update().allFiles.select("path"), Row("b") :: Nil)
     }
+  }
+
+  private val addA_P1 = AddFile("a", Map("part" -> "p1"), 1, 1, dataChange = true)
+  private val addB_P1 = AddFile("b", Map("part" -> "p1"), 1, 1, dataChange = true)
+  private val addC_P2 = AddFile("c", Map("part" -> "p2"), 1, 1, dataChange = true)
+  private val addD_P2 = AddFile("d", Map("part" -> "p2"), 1, 1, dataChange = true)
+
+  test("allow modify independent partitions") {
+    withTempDir { tempDir => withSQLConf(ENABLE_CONCURRENT_PARTITIONS_WRITE.key -> "true") {
+      val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
+      // Initialize the log and add data. Truncate() is just a no-op placeholder.
+      log.startTransaction().commit(addA_P1 :: addD_P2 :: Nil, Truncate())
+
+      val tx1 = log.startTransaction()
+      tx1.filterFiles()
+
+      // tx2 commits before tx1
+      val tx2 = log.startTransaction()
+      tx2.filterFiles()
+      tx2.commit(addA_P1.remove :: addB_P1 :: Nil, Truncate())
+
+      tx1.commit(addC_P2 :: addD_P2.remove :: Nil, Truncate())
+      checkAnswer(log.update().allFiles.select("path"), Row("b") :: Row("c") :: Nil)
+    }}
+  }
+
+  test("block modify dependent partitions") {
+    withTempDir { tempDir => withSQLConf(ENABLE_CONCURRENT_PARTITIONS_WRITE.key -> "true") {
+      val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
+      // Initialize the log and add data. Truncate() is just a no-op placeholder.
+      log.startTransaction().commit(addA_P1 :: addD_P2 :: Nil, Truncate())
+
+      val tx1 = log.startTransaction()
+      tx1.filterFiles()
+
+      // tx2 commits before tx1
+      val tx2 = log.startTransaction()
+      tx2.filterFiles()
+      tx2.commit(addA_P1.remove :: addB_P1 :: Nil, Truncate())
+
+      intercept[ConcurrentWriteException] {
+        // addB_P1 is manipulated in both transactions
+        tx1.commit(addA_P1 :: addB_P1.remove :: Nil, Truncate())
+      }
+    }}
   }
 
   test("allow concurrent set-txns with different app ids") {

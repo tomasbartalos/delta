@@ -20,7 +20,6 @@ import java.util.{HashMap, Locale}
 
 import org.apache.spark.sql.delta.actions.{Metadata, Protocol}
 import org.apache.spark.sql.delta.metering.DeltaLogging
-
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.unsafe.types.CalendarInterval
@@ -211,6 +210,9 @@ object DeltaConfigs extends DeltaLogging {
     }
   }
 
+  def enableConcurrentPartitionsWrite(sqlConfs: SQLConf): Boolean =
+    sqlConfs.getConf(ENABLE_CONCURRENT_PARTITIONS_WRITE)
+
   /**
    * The shortest duration we have to keep delta files around before deleting them. We can only
    * delete delta files that are before a compaction. We may keep files beyond this duration until
@@ -355,4 +357,15 @@ object DeltaConfigs extends DeltaLogging {
     a => a >= -1,
     "needs to be larger than or equal to -1.")
 
+  val ENABLE_CONCURRENT_PARTITIONS_WRITE =
+    SQLConf.buildConf("spark.databricks.delta.properties.concurrentPartitionsWrite")
+      .doc("Enables concurrent write to independent delta partitions. " +
+        "The implementation have following limitations:" +
+        " * if transaction reads from a set of partitions it must write to the same partition set" +
+        "   (If TX reads from P1, P2 then it must write to P1, P2)" +
+        "   This condition is satisfied for update, replaceWhere, merge" +
+        "   (if partitioning is not changed in data)" +
+        " * transactions can't perform delete operation")
+      .booleanConf
+      .createWithDefault(false)
 }

@@ -438,9 +438,14 @@ trait OptimisticTransactionImpl extends TransactionalWrite {
       if (metadataUpdates.nonEmpty) {
         throw new MetadataChangedException(commitInfo)
       }
-      // Fail if the data is different than what the txn read.
+
       if (dependsOnFiles && fileActions.nonEmpty) {
-        throw new ConcurrentWriteException(commitInfo)
+        if (isConcurrentPartitionWriteEnabled) {
+          checkConcurrentWriteByPartitions(actions, fileActions, commitInfo)
+        } else {
+          // Fail if the data is different than what the txn read.
+          throw new ConcurrentWriteException(commitInfo)
+        }
       }
       // Fail if idempotent transactions have conflicted.
       val txnOverlap = txns.map(_.appId).toSet intersect readTxn.toSet
@@ -450,5 +455,30 @@ trait OptimisticTransactionImpl extends TransactionalWrite {
     }
     logInfo(s"No logical conflicts with deltas [$checkVersion, $nextAttempt), retrying.")
     doCommit(nextAttempt, actions, attemptNumber + 1)
+  }
+
+  private def isConcurrentPartitionWriteEnabled = {
+    DeltaConfigs.enableConcurrentPartitionsWrite(spark.sessionState.conf)
+  }
+
+  private def checkConcurrentWriteByPartitions(
+      myActions: Seq[Action],
+      theirActions: Seq[Action],
+      commitInfo: Option[CommitInfo]): Unit = {
+
+    val partitionMapper: Action => Iterable[String] = {
+      case f: AddFile => f.partitionValues.values
+      case _ => None
+    }
+    val theirModifiedPartitions = theirActions.flatMap(partitionMapper)
+    val myModifiedPartitions = myActions.flatMap(partitionMapper)
+
+    if (myModifiedPartitions.isEmpty || theirModifiedPartitions.isEmpty) {
+      throw new ConcurrentWriteException(commitInfo)
+    }
+    if(myModifiedPartitions.exists(theirModifiedPartitions.contains)) {
+      throw new ConcurrentPartitionWriteException(
+        myModifiedPartitions.intersect(theirModifiedPartitions), commitInfo)
+    }
   }
 }
