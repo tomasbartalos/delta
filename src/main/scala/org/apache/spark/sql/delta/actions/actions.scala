@@ -16,16 +16,16 @@
 
 package org.apache.spark.sql.delta.actions
 
+import java.lang
 import java.net.URI
 import java.sql.Timestamp
 
 import org.apache.spark.sql.delta.util.JsonUtils
-import com.fasterxml.jackson.annotation.{JsonIgnore, JsonInclude}
+import com.fasterxml.jackson.annotation.{JsonIgnore, JsonIgnoreProperties, JsonInclude, JsonProperty}
 import com.fasterxml.jackson.core.JsonGenerator
 import com.fasterxml.jackson.databind.{JsonSerializer, SerializerProvider}
 import com.fasterxml.jackson.databind.annotation.{JsonDeserialize, JsonSerialize}
 import org.codehaus.jackson.annotate.JsonRawValue
-
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.execution.datasources.PartitioningUtils
@@ -162,12 +162,13 @@ object AddFile {
  * deleted permanently.
  */
 // scalastyle:off
+//@JsonIgnoreProperties(Array("partitionValues"))
 case class RemoveFile(
     path: String,
     @JsonDeserialize(contentAs = classOf[java.lang.Long])
     deletionTimestamp: Option[Long],
     dataChange: Boolean = true,
-    @JsonIgnore
+//    @JsonProperty("partitionValues")
     partitionValues: Map[String, String] = null) extends FileAction {
   override def wrap: SingleAction = SingleAction(remove = this)
 

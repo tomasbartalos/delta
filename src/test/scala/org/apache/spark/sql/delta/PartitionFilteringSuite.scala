@@ -98,10 +98,21 @@ class PartitionFilteringSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+//  test("Filter AddFiles and RemoveFiles 'in' with or operator") {
+//    withSnapshot { snapshot =>
+//      val filtered = snapshot.filesForScan(Nil, removeActions ++ addActions,
+//        ('part isin(2, 4) or 'part isin(3, 6)).expr :: Nil)
+//      assert(filtered.toSet ==
+//        (addC_P2 :: rmC_P2 :: addG_P4 :: rmG_P4:: Nil).toSet)
+//    }
+//  }
+
   def withSnapshot(test: Snapshot => Unit): Unit = {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
       test(log.snapshot)
     }
   }
+
+
 }

@@ -158,7 +158,7 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
     withConcurrentLog(addA_P1 :: addD_P2 :: addD_P2.remove :: Nil) { log =>
       val tx1 = log.startTransaction()
       // TX1 read P1
-      tx1.filterFiles(('part isin 1).expr :: Nil)
+      tx1.filterFiles(('part isin (1, 2)).expr :: Nil)
 
       val tx2 = log.startTransaction()
       tx2.filterFiles()
@@ -259,12 +259,13 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
 
       val tx2 = log.startTransaction()
       tx2.filterFiles()
-      // TX2 modifies a=1/b=2
+      // TX2 append a=1/b=2
       tx2.commit(addB_1_2_nested :: Nil, Truncate())
 
       intercept[ConcurrentWriteException] {
         val add = AddFile("a=1/b=2/x", Map("a" -> "1", "b" -> "2"),
           1, 1, dataChange = true)
+        // TX1 append a=1/b=2
         tx1.commit(add :: Nil, Truncate())
       }
     }

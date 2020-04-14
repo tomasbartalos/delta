@@ -17,7 +17,7 @@
 package org.apache.spark.sql.delta
 
 // scalastyle:off import.ordering.noEmptyLine
-import java.io.{File, FileNotFoundException, IOException}
+import java.io.{ByteArrayOutputStream, File, FileNotFoundException, IOException, PrintStream}
 import java.util.concurrent.{Callable, TimeUnit}
 import java.util.concurrent.locks.ReentrantLock
 
@@ -137,6 +137,8 @@ class DeltaLog private(
    * ------------------ */
 
   @volatile private var currentSnapshot: Snapshot = lastCheckpoint.map { c =>
+    val start = System.currentTimeMillis()
+    try {
     val checkpointFiles = c.parts
       .map(p => checkpointFileWithParts(logPath, c.version, p))
       .getOrElse(Seq(checkpointFileSingular(logPath, c.version)))
@@ -168,8 +170,17 @@ class DeltaLog private(
         recordDeltaEvent(this, "delta.checkpoint.error.partial")
         throw DeltaErrors.missingPartFilesException(c, e)
     }
+    } finally {
+      logInfo(s"Metadata load took: ${System.currentTimeMillis() - start} ms.")
+    }
   }.getOrElse {
-    new Snapshot(logPath, -1, None, Nil, minFileRetentionTimestamp, this, -1L)
+    val start = System.currentTimeMillis()
+    try {
+      val snapshot = new Snapshot(logPath, -1, None, Nil, minFileRetentionTimestamp, this, -1L)
+      snapshot
+    } finally {
+      logInfo(s"Metadata load took: ${System.currentTimeMillis() - start}")
+    }
   }
 
   if (currentSnapshot.version == -1) {
@@ -267,8 +278,11 @@ class DeltaLog private(
    */
   private def updateInternal(isAsync: Boolean): Snapshot =
     recordDeltaOperation(this, "delta.log.update", Map(TAG_ASYNC -> isAsync.toString)) {
+      val updateStart = System.currentTimeMillis()
+      try {
     withStatusCode("DELTA", "Updating the Delta table's state") {
       try {
+        val newFilesLoad = System.currentTimeMillis()
         val newFiles = store
           // List from the current version since we want to get the checkpoint file for the current
           // version
@@ -279,6 +293,8 @@ class DeltaLog private(
             isCheckpointFile(file.getPath) ||
               (isDeltaFile(file.getPath) && deltaVersion(file.getPath) > currentSnapshot.version)
         }.toArray
+        logInfo(s"Metadata reload: listing files took: " +
+          s"${System.currentTimeMillis() - newFilesLoad} ms.")
 
         val (checkpoints, deltas) = newFiles.partition(f => isCheckpointFile(f.getPath))
         if (deltas.isEmpty) {
@@ -352,6 +368,9 @@ class DeltaLog private(
       lastUpdateTimestamp = clock.getTimeMillis()
       currentSnapshot
     }
+      } finally {
+        logInfo(s"Metadata reload took: ${System.currentTimeMillis() - updateStart} ms.")
+      }
   }
 
 

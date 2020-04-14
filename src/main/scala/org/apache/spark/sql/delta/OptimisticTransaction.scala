@@ -498,10 +498,10 @@ trait OptimisticTransactionImpl extends TransactionalWrite {
     val theirModifiedPartitions = theirActions.flatMap(partitionExtractor(_)).toSet
     val partitionsToCheck = myActions.flatMap(partitionExtractor(_)).toSet
 
-    if (partitionsToCheck.exists(theirModifiedPartitions.contains)) {
-      val conflicts = partitionsToCheck.intersect(theirModifiedPartitions)
-      throw new ConcurrentPartitionWriteException(conflicts, commitInfo)
-    }
+//    if (partitionsToCheck.exists(theirModifiedPartitions.contains)) {
+//      val conflicts = partitionsToCheck.intersect(theirModifiedPartitions)
+//      throw new ConcurrentPartitionWriteException(conflicts, commitInfo)
+//    }
     // Check if they modified partitions that we intended to read
     val conflictingActions = readFilters.flatMap { filter =>
       snapshot.filterFileActions(theirActions, filter)
