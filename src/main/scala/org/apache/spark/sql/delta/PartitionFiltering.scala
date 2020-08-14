@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,10 @@ import org.apache.spark.sql.delta.stats.DeltaScan
 
 import org.apache.spark.sql.catalyst.expressions._
 
-trait PartitionFiltering {
-  self: Snapshot =>
+/** Provides the capability for partition pruning when querying a Delta table. */
+trait PartitionFiltering { self: Snapshot =>
 
-  def filesForScan(
-      projection: Seq[Attribute],
-      filters: Seq[Expression],
-      keepStats: Boolean = false): DeltaScan = {
+  def filesForScan(projection: Seq[Attribute], filters: Seq[Expression]): DeltaScan = {
     implicit val enc = SingleAction.addFileEncoder
 
     val partitionFilters = filters.flatMap { filter =>
@@ -35,7 +32,7 @@ trait PartitionFiltering {
     }
 
     val files = DeltaLog.filterFileList(
-      metadata.partitionColumns,
+      metadata.partitionSchema,
       allFiles.toDF(),
       partitionFilters).as[AddFile].collect()
 

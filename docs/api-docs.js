@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@
 
 $(document).ready(function() {
   var annotations = $("dt:contains('Annotations')").next("dd").children("span.name");
-  addBadges(annotations, "Unsable", ":: Unstable ::", '<span class="unstable badge">Unstable</span>');
+  addBadges(annotations, "Unstable", ":: Unstable ::", '<span class="unstable badge">Unstable</span>');
   addBadges(annotations, "Evolving", ":: Evolving ::", '<span class="evolving badge">Evolving</span>');
 });
 

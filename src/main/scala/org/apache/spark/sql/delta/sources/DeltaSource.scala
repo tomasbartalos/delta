@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,10 +29,27 @@ import org.apache.spark.sql.delta.schema.SchemaUtils
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.connector.read.streaming
+import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl}
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.types.StructType
 
-/** A case class to help with `Dataset` operations regarding Offset indexing. */
+/**
+ * A case class to help with `Dataset` operations regarding Offset indexing, representing AddFile
+ * actions in a Delta log. For proper offset tracking (SC-19523), there are also special sentinel
+ * values with index = -1 and add = null.
+ *
+ * This class is not designed to be persisted in offset logs or such.
+ *
+ * @param version The version of the Delta log containing this AddFile.
+ * @param index The index of this AddFile in the Delta log.
+ * @param add The AddFile.
+ * @param isLast A flag to indicate whether this is the last AddFile in the version. This is used
+ *               to resolve an off-by-one issue in the streaming offset interface; once we've read
+ *               to the end of a log version file, we check this flag to advance immediately to the
+ *               next one in the persisted offset. Without this special case we would re-read the
+ *               already completed log file.
+ */
 private[delta] case class IndexedFile(
     version: Long, index: Long, add: AddFile, isLast: Boolean = false)
 
@@ -50,19 +67,15 @@ case class DeltaSource(
     spark: SparkSession,
     deltaLog: DeltaLog,
     options: DeltaOptions,
-    filters: Seq[Expression] = Nil) extends Source with DeltaLogging {
-
-  private val maxFilesPerTrigger = options.maxFilesPerTrigger
+    filters: Seq[Expression] = Nil)
+  extends Source
+  with SupportsAdmissionControl
+  with DeltaLogging {
 
   // Deprecated. Please use `ignoreDeletes` or `ignoreChanges` from now on.
   private val ignoreFileDeletion = {
     if (options.ignoreFileDeletion) {
-      val docPage = DeltaErrors.baseDocsPath(spark.sparkContext.getConf) +
-        "/delta/delta-streaming.html#ignoring-updates-and-deletes"
-      logConsole(
-        s"""WARNING: The 'ignoreFileDeletion' option is deprecated. Switch to using one of
-           |'ignoreDeletes' or 'ignoreChanges'. Refer to $docPage for details.
-         """.stripMargin)
+      logConsole(DeltaErrors.ignoreStreamingUpdatesAndDeletesWarning(spark))
       recordDeltaEvent(deltaLog, "delta.deprecation.ignoreFileDeletion")
     }
     options.ignoreFileDeletion
@@ -79,7 +92,7 @@ case class DeltaSource(
   override val schema: StructType = deltaLog.snapshot.metadata.schema
 
   // This was checked before creating ReservoirSource
-  assert(!schema.isEmpty)
+  assert(schema.nonEmpty)
 
   private val tableId = deltaLog.snapshot.metadata.id
 
@@ -102,11 +115,11 @@ case class DeltaSource(
     def filterAndIndexDeltaLogs(startVersion: Long): Iterator[IndexedFile] = {
       deltaLog.getChanges(startVersion).flatMap { case (version, actions) =>
         val addFiles = verifyStreamHygieneAndFilterAddFiles(actions)
-        addFiles
+        Iterator.single(IndexedFile(version, -1, null)) ++ addFiles
           .map(_.asInstanceOf[AddFile])
           .zipWithIndex.map { case (action, index) =>
-            IndexedFile(version, index.toLong, action, isLast = index + 1 == addFiles.size)
-          }
+          IndexedFile(version, index.toLong, action, isLast = index + 1 == addFiles.size)
+        }
       }
     }
 
@@ -117,7 +130,7 @@ case class DeltaSource(
     }
 
     iter.filter { case IndexedFile(version, index, _, _) =>
-      version > fromVersion || index > fromIndex
+      version > fromVersion || (index == -1 || index > fromIndex)
     }
   }
 
@@ -148,20 +161,28 @@ case class DeltaSource(
   private def getChangesWithRateLimit(
       fromVersion: Long,
       fromIndex: Long,
-      isStartingVersion: Boolean): Iterator[IndexedFile] = {
-
+      isStartingVersion: Boolean,
+      limits: Option[AdmissionLimits] = Some(new AdmissionLimits())): Iterator[IndexedFile] = {
     val changes = getChanges(fromVersion, fromIndex, isStartingVersion)
+    if (limits.isEmpty) return changes
 
-
-    changes.take(maxFilesPerTrigger.getOrElse(DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION_DEFAULT))
+    // Take each change until we've seen the configured number of addFiles. Some changes don't
+    // represent file additions; we retain them for offset tracking, but they don't count towards
+    // the maxFilesPerTrigger conf.
+    var admissionControl = limits.get
+    changes.takeWhile { action =>
+      admissionControl.admit(Option(action.add))
+    }
   }
 
-  private def getStartingOffset(): Option[Offset] = {
+  private def getStartingOffset(
+      limits: Option[AdmissionLimits] = Some(new AdmissionLimits())): Option[Offset] = {
     val version = deltaLog.snapshot.version
     if (version < 0) {
       return None
     }
-    val last = iteratorLast(getChangesWithRateLimit(version, -1L, isStartingVersion = true))
+    val last = iteratorLast(
+      getChangesWithRateLimit(version, -1L, isStartingVersion = true, limits))
     if (last.isEmpty) {
       return None
     }
@@ -179,14 +200,20 @@ case class DeltaSource(
     }
   }
 
-  override def getOffset: Option[Offset] = {
+  override def getDefaultReadLimit: ReadLimit = {
+    new AdmissionLimits().toReadLimit
+  }
+
+  override def latestOffset(startOffset: streaming.Offset, limit: ReadLimit): streaming.Offset = {
     val currentOffset = if (previousOffset == null) {
-      getStartingOffset()
+      getStartingOffset(AdmissionLimits(limit))
     } else {
-      val last = iteratorLast(getChangesWithRateLimit(
+      val changes = getChangesWithRateLimit(
         previousOffset.reservoirVersion,
         previousOffset.index,
-        previousOffset.isStartingVersion))
+        previousOffset.isStartingVersion,
+        AdmissionLimits(limit))
+      val last = iteratorLast(changes)
       if (last.isEmpty) {
         Some(previousOffset)
       } else {
@@ -205,7 +232,12 @@ case class DeltaSource(
       }
     }
     logDebug(s"previousOffset -> currentOffset: $previousOffset -> $currentOffset")
-    currentOffset
+    currentOffset.orNull
+  }
+
+  override def getOffset: Option[Offset] = {
+    throw new UnsupportedOperationException(
+      "latestOffset(Offset, ReadLimit) should be called instead of this method")
   }
 
   private def verifyStreamHygieneAndFilterAddFiles(actions: Seq[Action]): Seq[Action] = {
@@ -271,7 +303,7 @@ case class DeltaSource(
     val addFilesIter = changes.takeWhile { case IndexedFile(version, index, _, _) =>
       version < endOffset.reservoirVersion ||
         (version == endOffset.reservoirVersion && index <= endOffset.index)
-    }.map(_.add)
+    }.collect { case i: IndexedFile if i.add != null => i.add }
     val addFiles =
       addFilesIter.filter(a => excludeRegex.forall(_.findFirstIn(a.path).isEmpty)).toSeq
     logDebug(s"start: $start end: $end ${addFiles.toList}")
@@ -290,4 +322,53 @@ case class DeltaSource(
   }
 
   override def toString(): String = s"DeltaSource[${deltaLog.dataPath}]"
+
+  /**
+   * Class that helps controlling how much data should be processed by a single micro-batch.
+   */
+  private class AdmissionLimits(
+      maxFiles: Option[Int] = options.maxFilesPerTrigger,
+      private var bytesToTake: Long = options.maxBytesPerTrigger.getOrElse(Long.MaxValue)) {
+
+    private var filesToTake = maxFiles.getOrElse {
+      if (options.maxBytesPerTrigger.isEmpty) {
+        DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION_DEFAULT
+      } else {
+        Int.MaxValue - 8 // - 8 to prevent JVM Array allocation OOM
+      }
+    }
+
+    /** Whether to admit the next file */
+    def admit(add: Option[AddFile]): Boolean = {
+      if (add.isEmpty) return true
+      val shouldAdmit = filesToTake > 0 && bytesToTake > 0
+      filesToTake -= 1
+      bytesToTake -= add.get.size
+      shouldAdmit
+    }
+
+    def toReadLimit: ReadLimit = {
+      if (options.maxFilesPerTrigger.isDefined && options.maxBytesPerTrigger.isDefined) {
+        CompositeLimit(
+          ReadMaxBytes(options.maxBytesPerTrigger.get),
+          ReadLimit.maxFiles(options.maxFilesPerTrigger.get).asInstanceOf[ReadMaxFiles])
+      } else if (options.maxBytesPerTrigger.isDefined) {
+        ReadMaxBytes(options.maxBytesPerTrigger.get)
+      } else {
+        ReadLimit.maxFiles(
+          options.maxFilesPerTrigger.getOrElse(DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION_DEFAULT))
+      }
+    }
+  }
+
+  private object AdmissionLimits {
+    def apply(limit: ReadLimit): Option[AdmissionLimits] = limit match {
+      case _: ReadAllAvailable => None
+      case maxFiles: ReadMaxFiles => Some(new AdmissionLimits(Some(maxFiles.maxFiles())))
+      case maxBytes: ReadMaxBytes => Some(new AdmissionLimits(None, maxBytes.maxBytes))
+      case composite: CompositeLimit =>
+        Some(new AdmissionLimits(Some(composite.files.maxFiles()), composite.bytes.maxBytes))
+      case other => throw new UnsupportedOperationException(s"Unknown ReadLimit: $other")
+    }
+  }
 }

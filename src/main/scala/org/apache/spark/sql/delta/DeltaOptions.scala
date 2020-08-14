@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,17 @@
 
 package org.apache.spark.sql.delta
 
+import java.util.Locale
 import java.util.regex.PatternSyntaxException
 
 import scala.util.Try
 import scala.util.matching.Regex
 
-import org.apache.spark.sql.delta.DeltaOptions.{MERGE_SCHEMA_OPTION, OVERWRITE_SCHEMA_OPTION}
+import org.apache.spark.sql.delta.DeltaOptions.{DATA_CHANGE_OPTION, MERGE_SCHEMA_OPTION, OVERWRITE_SCHEMA_OPTION}
+import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
+import org.apache.spark.network.util.{ByteUnit, JavaUtils}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.internal.SQLConf
 
@@ -46,6 +49,7 @@ trait DeltaWriteOptions
   import DeltaOptions._
 
   val replaceWhere: Option[String] = options.get(REPLACE_WHERE_OPTION)
+  val userMetadata: Option[String] = options.get(USER_METADATA_OPTION)
 
   /**
    * Whether to add an adaptive shuffle before writing out the files to break skew, and coalesce
@@ -73,8 +77,19 @@ trait DeltaWriteOptionsImpl extends DeltaOptionParser {
    * MODIFY permissions, when schema changes require OWN permissions.
    */
   def canOverwriteSchema: Boolean = {
-    options.get(OVERWRITE_SCHEMA_OPTION).map(toBoolean(_, OVERWRITE_SCHEMA_OPTION)).getOrElse(false)
+    options.get(OVERWRITE_SCHEMA_OPTION).exists(toBoolean(_, OVERWRITE_SCHEMA_OPTION))
   }
+
+  /**
+   * Whether to write new data to the table or just rearrange data that is already
+   * part of the table. This option declares that the data being written by this job
+   * does not change any data in the table and merely rearranges existing data.
+   * This makes sure streaming queries reading from this table will not see any new changes
+   */
+  def rearrangeOnly: Boolean = {
+    options.get(DATA_CHANGE_OPTION).exists(!toBoolean(_, DATA_CHANGE_OPTION))
+  }
+
 }
 
 trait DeltaReadOptions extends DeltaOptionParser {
@@ -87,14 +102,19 @@ trait DeltaReadOptions extends DeltaOptionParser {
     }
   }
 
+  val maxBytesPerTrigger = options.get(MAX_BYTES_PER_TRIGGER_OPTION).map { str =>
+    Try(JavaUtils.byteStringAs(str, ByteUnit.BYTE)).toOption.filter(_ > 0).getOrElse {
+      throw DeltaErrors.illegalDeltaOptionException(
+        MAX_BYTES_PER_TRIGGER_OPTION, str, "must be a size configuration such as '10g'")
+    }
+  }
+
   val ignoreFileDeletion = options.get(IGNORE_FILE_DELETION_OPTION)
-    .map(toBoolean(_, IGNORE_FILE_DELETION_OPTION)).getOrElse(false)
+    .exists(toBoolean(_, IGNORE_FILE_DELETION_OPTION))
 
-  val ignoreChanges = options.get(IGNORE_CHANGES_OPTION)
-    .map(toBoolean(_, IGNORE_CHANGES_OPTION)).getOrElse(false)
+  val ignoreChanges = options.get(IGNORE_CHANGES_OPTION).exists(toBoolean(_, IGNORE_CHANGES_OPTION))
 
-  val ignoreDeletes = options.get(IGNORE_DELETES_OPTION)
-    .map(toBoolean(_, IGNORE_DELETES_OPTION)).getOrElse(false)
+  val ignoreDeletes = options.get(IGNORE_DELETES_OPTION).exists(toBoolean(_, IGNORE_DELETES_OPTION))
 
   val excludeRegex: Option[Regex] = try options.get(EXCLUDE_REGEX_OPTION).map(_.r) catch {
     case e: PatternSyntaxException =>
@@ -108,14 +128,16 @@ trait DeltaReadOptions extends DeltaOptionParser {
  * Options for the Delta data source.
  */
 class DeltaOptions(
-    @transient protected val options: CaseInsensitiveMap[String],
+    @transient protected[delta] val options: CaseInsensitiveMap[String],
     @transient protected val sqlConf: SQLConf)
   extends DeltaWriteOptions with DeltaReadOptions with Serializable {
+
+  DeltaOptions.verifyOptions(options)
 
   def this(options: Map[String, String], conf: SQLConf) = this(CaseInsensitiveMap(options), conf)
 }
 
-object DeltaOptions {
+object DeltaOptions extends DeltaLogging {
 
   /** An option to overwrite only the data that matches predicates over partition columns. */
   val REPLACE_WHERE_OPTION = "replaceWhere"
@@ -123,12 +145,47 @@ object DeltaOptions {
   val MERGE_SCHEMA_OPTION = "mergeSchema"
   /** An option to allow overwriting schema and partitioning during an overwrite write operation. */
   val OVERWRITE_SCHEMA_OPTION = "overwriteSchema"
+  /** An option to specify user-defined metadata in commitInfo */
+  val USER_METADATA_OPTION = "userMetadata"
 
   val MAX_FILES_PER_TRIGGER_OPTION = "maxFilesPerTrigger"
   val MAX_FILES_PER_TRIGGER_OPTION_DEFAULT = 1000
+  val MAX_BYTES_PER_TRIGGER_OPTION = "maxBytesPerTrigger"
   val EXCLUDE_REGEX_OPTION = "excludeRegex"
   val IGNORE_FILE_DELETION_OPTION = "ignoreFileDeletion"
   val IGNORE_CHANGES_OPTION = "ignoreChanges"
   val IGNORE_DELETES_OPTION = "ignoreDeletes"
   val OPTIMIZE_WRITE_OPTION = "optimizeWrite"
+  val DATA_CHANGE_OPTION = "dataChange"
+
+  val validOptionKeys : Set[String] = Set(
+    REPLACE_WHERE_OPTION,
+    MERGE_SCHEMA_OPTION,
+    EXCLUDE_REGEX_OPTION,
+    OVERWRITE_SCHEMA_OPTION,
+    USER_METADATA_OPTION,
+    MAX_FILES_PER_TRIGGER_OPTION,
+    IGNORE_FILE_DELETION_OPTION,
+    IGNORE_CHANGES_OPTION,
+    IGNORE_DELETES_OPTION,
+    OPTIMIZE_WRITE_OPTION,
+    DATA_CHANGE_OPTION,
+    "queryName",
+    "checkpointLocation",
+    "path",
+    "timestampAsOf",
+    "versionAsOf"
+  )
+
+  /** Iterates over all user passed options and logs any that are not valid. */
+  def verifyOptions(options: CaseInsensitiveMap[String]): Unit = {
+    val invalidUserOptions = SQLConf.get.redactOptions(options --
+      validOptionKeys.map(_.toLowerCase(Locale.ROOT)))
+    if (invalidUserOptions.nonEmpty) {
+      recordDeltaEvent(null,
+        "delta.option.invalid",
+        data = invalidUserOptions
+      )
+    }
+  }
 }

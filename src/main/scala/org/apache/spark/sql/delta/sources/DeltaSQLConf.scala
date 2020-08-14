@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ import org.apache.spark.sql.internal.SQLConf
  */
 object DeltaSQLConf {
   def buildConf(key: String): ConfigBuilder = SQLConf.buildConf(s"spark.databricks.delta.$key")
+  def buildStaticConf(key: String): ConfigBuilder =
+    SQLConf.buildStaticConf(s"spark.databricks.delta.$key")
 
 
   val RESOLVE_TIME_TRAVEL_ON_IDENTIFIER =
@@ -43,13 +45,62 @@ object DeltaSQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_USER_METADATA =
+    buildConf("commitInfo.userMetadata")
+      .doc("Arbitrary user-defined metadata to include in CommitInfo. Requires commitInfo.enabled.")
+      .stringConf
+      .createOptional
+
+  val DELTA_CONVERT_USE_METADATA_LOG =
+    buildConf("convert.useMetadataLog")
+      .doc(
+        """ When converting to a Parquet table that was created by Structured Streaming, whether
+        |  to use the transaction log under `_spark_metadata` as the source of truth for files
+        | contained in the table.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_SNAPSHOT_PARTITIONS =
     buildConf("snapshotPartitions")
       .internal()
       .doc("Number of partitions to use when building a Delta Lake snapshot.")
       .intConf
       .checkValue(n => n > 0, "Delta snapshot partition number must be positive.")
-      .createWithDefault(50)
+      .createOptional
+
+  val DELTA_PARTITION_COLUMN_CHECK_ENABLED =
+    buildConf("partitionColumnValidity.enabled")
+      .internal()
+      .doc("Whether to check whether the partition column names have valid names, just like " +
+        "the data columns.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_STATE_RECONSTRUCTION_VALIDATION_ENABLED =
+    buildConf("stateReconstructionValidation.enabled")
+      .internal()
+      .doc("Whether to perform validation checks on the reconstructed state.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_COMMIT_VALIDATION_ENABLED =
+    buildConf("commitValidation.enabled")
+      .internal()
+      .doc("Whether to perform validation checks before commit or not.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_SCHEMA_ON_READ_CHECK_ENABLED =
+    buildConf("checkLatestSchemaOnRead")
+      .doc("In Delta, we always try to give users the latest version of their data without " +
+        "having to call REFRESH TABLE or redefine their DataFrames when used in the context of " +
+        "streaming. There is a possibility that the schema of the latest version of the table " +
+        "may be incompatible with the schema at the time of DataFrame creation. This flag " +
+        "enables a check that ensures that users won't read corrupt data if the source schema " +
+        "changes in an incompatible way.")
+      .booleanConf
+      .createWithDefault(true)
 
   val DELTA_COLLECT_STATS =
     buildConf("stats.collect")
@@ -78,6 +129,17 @@ object DeltaSQLConf {
       .doc("Enable sample based estimation.")
       .booleanConf
       .createWithDefault(false)
+
+  val DELTA_CONVERT_METADATA_CHECK_ENABLED =
+    buildConf("convert.metadataCheck.enabled")
+      .doc(
+        """
+          |If enabled, during convert to delta, if there is a difference between the catalog table's
+          |properties and the Delta table's configuration, we should error. If disabled, merge
+          |the two configurations with the same semantics as update and merge.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(true)
 
   val DELTA_STATS_SKIPPING =
     buildConf("stats.skipping")
@@ -129,6 +191,13 @@ object DeltaSQLConf {
         "therefore we choose 1000.")
       .intConf
       .createWithDefault(1000)
+
+  val DELTA_HISTORY_METRICS_ENABLED =
+    buildConf("history.metricsEnabled")
+      .doc("Enables Metrics reporting in Describe History. CommitInfo will now record the " +
+        "Operation Metrics.")
+      .booleanConf
+      .createWithDefault(true)
 
   val DELTA_VACUUM_RETENTION_CHECK_ENABLED =
     buildConf("retentionDurationCheck.enabled")
@@ -205,5 +274,44 @@ object DeltaSQLConf {
       .doc("Max row count of inserts in each MERGE execution.")
       .longConf
       .createWithDefault(10000L)
+
+  val MERGE_INSERT_ONLY_ENABLED =
+    buildConf("merge.optimizeInsertOnlyMerge.enabled")
+      .internal()
+      .doc(
+        """
+          |If enabled, merge without any matched clause (i.e., insert-only merge) will be optimized
+          |by avoiding rewriting old files and just inserting new files.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
+  val MERGE_REPARTITION_BEFORE_WRITE =
+    buildConf("merge.repartitionBeforeWrite.enabled")
+      .internal()
+      .doc(
+        """
+          |When enabled, merge will repartition the output by the table's partition columns before
+          |writing the files.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
+  val MERGE_MATCHED_ONLY_ENABLED =
+    buildConf("merge.optimizeMatchedOnlyMerge.enabled")
+      .internal()
+      .doc(
+        """If enabled, merge without 'when not matched' clause will be optimized to use a
+          |right outer join instead of a full outer join.
+        """.stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
+  val DELTA_LAST_COMMIT_VERSION_IN_SESSION =
+    buildConf("lastCommitVersionInSession")
+      .doc("The version of the last commit made in the SparkSession for any table.")
+      .longConf
+      .checkValue(_ >= 0, "the version must be >= 0")
+      .createOptional
 
 }

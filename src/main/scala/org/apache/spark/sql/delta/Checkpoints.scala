@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapred.{JobConf, TaskAttemptContextImpl, TaskAttemptID}
 import org.apache.hadoop.mapreduce.{Job, TaskType}
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.util.SerializableConfiguration
@@ -202,7 +203,7 @@ trait Checkpoints extends DeltaLogging {
   }
 }
 
-object Checkpoints {
+object Checkpoints extends DeltaLogging {
   /**
    * Writes out the contents of a [[Snapshot]] into a checkpoint file that
    * can be used to short-circuit future replays of the log.
@@ -304,6 +305,11 @@ object Checkpoints {
     if (numOfFiles.value != snapshot.numOfFiles) {
       throw new IllegalStateException(
         "State of the checkpoint doesn't match that of the snapshot.")
+    }
+
+    // Attempting to write empty checkpoint
+    if (checkpointSize.value == 0) {
+      logWarning(DeltaErrors.EmptyCheckpointErrorMessage)
     }
     CheckpointMetaData(snapshot.version, checkpointSize.value, None)
   }

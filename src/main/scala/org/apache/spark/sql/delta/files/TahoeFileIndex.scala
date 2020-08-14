@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,11 @@ package org.apache.spark.sql.delta.files
 
 import java.net.URI
 
-import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
+import org.apache.spark.sql.delta.{DeltaErrors, DeltaLog, Snapshot}
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.actions.SingleAction.addFileEncoder
+import org.apache.spark.sql.delta.schema.SchemaUtils
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.fs.Path
 
@@ -39,9 +41,6 @@ abstract class TahoeFileIndex(
 
   def tableVersion: Long = deltaLog.snapshot.version
 
-  /** Get a snapshot of the Delta table. */
-  def getSnapshot(stalenessAcceptable: Boolean): Snapshot
-
   override def rootPaths: Seq[Path] = path :: Nil
 
   /**
@@ -49,8 +48,7 @@ abstract class TahoeFileIndex(
    */
   def matchingFiles(
       partitionFilters: Seq[Expression],
-      dataFilters: Seq[Expression],
-      keepStats: Boolean = false): Seq[AddFile]
+      dataFilters: Seq[Expression]): Seq[AddFile]
 
   override def listFiles(
       partitionFilters: Seq[Expression],
@@ -106,6 +104,12 @@ abstract class TahoeFileIndex(
       input
     }
   }
+
+  /**
+   * Returns the path of the base directory of the given file path (i.e. its parent directory with
+   * all the partition directories stripped off).
+   */
+  def getBasePath(filePath: Path): Option[Path] = Some(path)
 }
 
 
@@ -116,29 +120,47 @@ case class TahoeLogFileIndex(
     override val spark: SparkSession,
     override val deltaLog: DeltaLog,
     override val path: Path,
+    snapshotAtAnalysis: Snapshot,
     partitionFilters: Seq[Expression] = Nil,
-    versionToUse: Option[Long] = None)
+    isTimeTravelQuery: Boolean = false)
   extends TahoeFileIndex(spark, deltaLog, path) {
 
-  override def tableVersion: Long = versionToUse.getOrElse(deltaLog.snapshot.version)
+  override def tableVersion: Long = {
+    if (isTimeTravelQuery) snapshotAtAnalysis.version else deltaLog.snapshot.version
+  }
 
-  private lazy val historicalSnapshotOpt: Option[Snapshot] =
-    versionToUse.map(deltaLog.getSnapshotAt(_))
+  private def checkSchemaOnRead: Boolean = {
+    spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SCHEMA_ON_READ_CHECK_ENABLED)
+  }
 
-  override def getSnapshot(stalenessAcceptable: Boolean): Snapshot = {
-    historicalSnapshotOpt.getOrElse(deltaLog.update(stalenessAcceptable))
+  protected def getSnapshotToScan: Snapshot = {
+    if (isTimeTravelQuery) snapshotAtAnalysis else deltaLog.update(stalenessAcceptable = true)
+  }
+
+  /** Provides the version that's being used as part of the scan if this is a time travel query. */
+  def versionToUse: Option[Long] = if (isTimeTravelQuery) Some(snapshotAtAnalysis.version) else None
+
+  def getSnapshot: Snapshot = {
+    val snapshotToScan = getSnapshotToScan
+    if (checkSchemaOnRead) {
+      // Ensure that the schema hasn't changed in an incompatible manner since analysis time
+      val snapshotSchema = snapshotToScan.metadata.schema
+      if (!SchemaUtils.isReadCompatible(snapshotAtAnalysis.schema, snapshotSchema)) {
+        throw DeltaErrors.schemaChangedSinceAnalysis(snapshotAtAnalysis.schema, snapshotSchema)
+      }
+    }
+    snapshotToScan
   }
 
   override def matchingFiles(
       partitionFilters: Seq[Expression],
-      dataFilters: Seq[Expression],
-      keepStats: Boolean = false): Seq[AddFile] = {
-    getSnapshot(stalenessAcceptable = false).filesForScan(
-      projection = Nil, this.partitionFilters ++ partitionFilters ++ dataFilters, keepStats).files
+      dataFilters: Seq[Expression]): Seq[AddFile] = {
+    getSnapshot.filesForScan(
+      projection = Nil, this.partitionFilters ++ partitionFilters ++ dataFilters).files
   }
 
   override def inputFiles: Array[String] = {
-    getSnapshot(stalenessAcceptable = false).filesForScan(
+    getSnapshot.filesForScan(
       projection = Nil, partitionFilters).files.map(f => absolutePath(f.path).toString).toArray
   }
 
@@ -147,8 +169,8 @@ case class TahoeLogFileIndex(
 
   override def equals(that: Any): Boolean = that match {
     case t: TahoeLogFileIndex =>
-      t.deltaLog.tableId == deltaLog.tableId && t.versionToUse == versionToUse &&
-        t.path == path && t.partitionFilters == partitionFilters
+      t.deltaLog.compositeId == deltaLog.compositeId && t.isTimeTravelQuery == isTimeTravelQuery &&
+        t.partitionFilters == partitionFilters
     case _ => false
   }
 
@@ -156,8 +178,12 @@ case class TahoeLogFileIndex(
     31 * path.hashCode() + partitionFilters.hashCode()
   }
 
-  override def partitionSchema: StructType = historicalSnapshotOpt.map(_.metadata.partitionSchema)
-    .getOrElse(super.partitionSchema)
+  override def partitionSchema: StructType = snapshotAtAnalysis.metadata.partitionSchema
+}
+
+object TahoeLogFileIndex {
+  def apply(spark: SparkSession, deltaLog: DeltaLog): TahoeLogFileIndex =
+    TahoeLogFileIndex(spark, deltaLog, deltaLog.dataPath, deltaLog.snapshot)
 }
 
 /**
@@ -175,16 +201,11 @@ class TahoeBatchFileIndex(
 
   override def tableVersion: Long = snapshot.version
 
-  override def getSnapshot(stalenessAcceptable: Boolean): Snapshot = {
-    snapshot
-  }
-
   override def matchingFiles(
       partitionFilters: Seq[Expression],
-      dataFilters: Seq[Expression],
-      keepStats: Boolean = false): Seq[AddFile] = {
+      dataFilters: Seq[Expression]): Seq[AddFile] = {
     DeltaLog.filterFileList(
-      snapshot.metadata.partitionColumns,
+      snapshot.metadata.partitionSchema,
       spark.createDataset(addFiles)(addFileEncoder).toDF(), partitionFilters)
       .as[AddFile](addFileEncoder)
       .collect()

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ import java.io.File
 import java.util.Locale
 
 import org.apache.spark.sql.delta.actions.CommitInfo
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.commons.io.FileUtils
 import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.sql._
@@ -168,7 +170,7 @@ class DeltaSinkSuite extends StreamTest {
         .start(outputDir.getCanonicalPath)
 
       try {
-        // The output is partitoned by "value", so the value will appear in the file path.
+        // The output is partitioned by "value", so the value will appear in the file path.
         // This is to test if we handle spaces in the path correctly.
         inputData.addData("hello world")
         failAfter(streamingTimeout) {
@@ -208,14 +210,14 @@ class DeltaSinkSuite extends StreamTest {
         assert(outputDf.schema === expectedSchema)
 
         // Verify the correct partitioning schema has been inferred
-        val hadoopdFsRelations = outputDf.queryExecution.analyzed.collect {
+        val hadoopFsRelations = outputDf.queryExecution.analyzed.collect {
           case LogicalRelation(baseRelation, _, _, _) if
               baseRelation.isInstanceOf[HadoopFsRelation] =>
             baseRelation.asInstanceOf[HadoopFsRelation]
         }
-        assert(hadoopdFsRelations.size === 1)
-        assert(hadoopdFsRelations.head.partitionSchema.exists(_.name == "id"))
-        assert(hadoopdFsRelations.head.dataSchema.exists(_.name == "value"))
+        assert(hadoopFsRelations.size === 1)
+        assert(hadoopFsRelations.head.partitionSchema.exists(_.name == "id"))
+        assert(hadoopFsRelations.head.dataSchema.exists(_.name == "value"))
 
         // Verify the data is correctly read
         checkDatasetUnorderly(
@@ -468,6 +470,65 @@ class DeltaSinkSuite extends StreamTest {
       assert(
         !isLastCommitBlindAppend,
         "joining with target table in the query should have isBlindAppend = false")
+    }
+  }
+
+  test("do not trust user nullability, so that parquet files aren't corrupted") {
+    val jsonRec = """{"s": "ss", "b": {"s": "ss"}}"""
+    val schema = new StructType()
+      .add("s", StringType)
+      .add("b", new StructType()
+        .add("s", StringType)
+        .add("i", IntegerType, nullable = false))
+      .add("c", IntegerType, nullable = false)
+
+    withTempDir { base =>
+      val sourceDir = new File(base, "source").getCanonicalPath
+      val tableDir = new File(base, "output").getCanonicalPath
+      val chkDir = new File(base, "checkpoint").getCanonicalPath
+
+      FileUtils.write(new File(sourceDir, "a.json"), jsonRec)
+
+      val q = spark.readStream
+        .format("json")
+        .schema(schema)
+        .load(sourceDir)
+        .withColumn("file", input_file_name()) // Not sure why needs this to reproduce
+        .writeStream
+        .format("delta")
+        .trigger(org.apache.spark.sql.streaming.Trigger.Once)
+        .option("checkpointLocation", chkDir)
+        .start(tableDir)
+
+      q.awaitTermination()
+
+      checkAnswer(
+        spark.read.format("delta").load(tableDir).drop("file"),
+        Seq(Row("ss", Row("ss", null), null)))
+    }
+  }
+
+  test("history includes user-defined metadata for DataFrame.writeStream API") {
+    failAfter(streamingTimeout) {
+      withTempDirs { (outputDir, checkpointDir) =>
+        val inputData = MemoryStream[Int]
+        val df = inputData.toDF()
+        val query = df.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .option("userMetadata", "testMeta!")
+          .format("delta")
+          .start(outputDir.getCanonicalPath)
+        val log = DeltaLog.forTable(spark, outputDir.getCanonicalPath)
+
+        inputData.addData(1)
+        query.processAllAvailable()
+
+        val lastCommitInfo = io.delta.tables.DeltaTable.forPath(spark, outputDir.getCanonicalPath)
+            .history(1).as[CommitInfo].head
+
+        assert(lastCommitInfo.userMetadata === Some("testMeta!"))
+        query.stop()
+      }
     }
   }
 }

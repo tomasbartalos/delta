@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,31 +20,24 @@ import java.io.{File, FileInputStream, OutputStream}
 import java.net.URI
 import java.util.UUID
 
-import org.apache.spark.sql.delta.actions.{AddFile, Format, InvalidProtocolVersionException, Protocol}
+import org.apache.spark.sql.delta.actions.{AddFile, InvalidProtocolVersionException, Protocol}
 import org.apache.spark.sql.delta.sources.{DeltaSourceOffset, DeltaSQLConf}
 import org.apache.spark.sql.delta.util.{FileNames, JsonUtils}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 
-import org.apache.spark.sql.{AnalysisException, DataFrame}
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.execution.streaming._
-import org.apache.spark.sql.streaming.{OutputMode, StreamingQueryException, StreamTest, Trigger}
+import org.apache.spark.sql.streaming.{OutputMode, StreamingQueryException, Trigger}
 import org.apache.spark.sql.streaming.util.StreamManualClock
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.{ManualClock, Utils}
 
-class DeltaSourceSuite extends StreamTest {
+class DeltaSourceSuite extends DeltaSourceSuiteBase {
 
   import testImplicits._
-
-  object AddToReservoir {
-    def apply(path: File, data: DataFrame): AssertOnQuery =
-      AssertOnQuery { _ =>
-        data.write.format("delta").mode("append").save(path.getAbsolutePath)
-        true
-      }
-  }
 
   private def withTempDirs(f: (File, File, File) => Unit): Unit = {
     withTempDir { file1 =>
@@ -83,17 +76,6 @@ class DeltaSourceSuite extends StreamTest {
         assert(e.getMessage.contains(msg))
       }
     }
-  }
-
-  protected def withMetadata(
-      deltaLog: DeltaLog,
-      schema: StructType,
-      format: String = "parquet"): Unit = {
-    val txn = deltaLog.startTransaction()
-    txn.commit(txn.metadata.copy(
-      schemaString = schema.json,
-      format = Format(format)
-    ) :: Nil, DeltaOperations.ManualUpdate)
   }
 
   test("basic") {
@@ -151,7 +133,7 @@ class DeltaSourceSuite extends StreamTest {
     }
   }
 
-  testQuietly("disallow to change schema after staring a streaming query") {
+  testQuietly("disallow to change schema after starting a streaming query") {
     withTempDir { inputDir =>
       val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
       (0 until 5).foreach { i =>
@@ -166,7 +148,7 @@ class DeltaSourceSuite extends StreamTest {
       testStream(df)(
         AssertOnQuery { q => q.processAllAvailable(); true },
         CheckAnswer((0 until 5).map(_.toString): _*),
-        AssertOnQuery { q =>
+        AssertOnQuery { _ =>
           withMetadata(deltaLog, StructType.fromDDL("id LONG, value STRING"))
           true
         },
@@ -320,6 +302,229 @@ class DeltaSourceSuite extends StreamTest {
     }
   }
 
+  test("maxFilesPerTrigger: ignored when using Trigger.Once") {
+    withTempDir { inputDir =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      (0 until 5).foreach { i =>
+        val v = Seq(i.toString).toDF
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION, "1")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("memory")
+        .trigger(Trigger.Once)
+        .queryName("triggerOnceTest")
+        .start()
+      try {
+        assert(q.awaitTermination(streamingTimeout.toMillis))
+        assert(q.recentProgress.count(_.numInputRows != 0) == 1) // only one trigger was run
+        checkAnswer(sql("SELECT * from triggerOnceTest"), (0 until 5).map(_.toString).toDF)
+      } finally {
+        q.stop()
+      }
+    }
+  }
+
+  test("maxBytesPerTrigger: process at least one file") {
+    withTempDir { inputDir =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      (0 until 5).foreach { i =>
+        val v = Seq(i.toString).toDF
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "1b")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("memory")
+        .queryName("maxBytesPerTriggerTest")
+        .start()
+      try {
+        q.processAllAvailable()
+        val progress = q.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 5)
+        progress.foreach { p =>
+          assert(p.numInputRows === 1)
+        }
+        checkAnswer(sql("SELECT * from maxBytesPerTriggerTest"), (0 until 5).map(_.toString).toDF)
+      } finally {
+        q.stop()
+      }
+    }
+  }
+
+  test("maxBytesPerTrigger: metadata checkpoint") {
+    withTempDir { inputDir =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      (0 until 20).foreach { i =>
+        val v = Seq(i.toString).toDF
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "1b")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("memory")
+        .queryName("maxBytesPerTriggerTest")
+        .start()
+      try {
+        q.processAllAvailable()
+        val progress = q.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 20)
+        progress.foreach { p =>
+          assert(p.numInputRows === 1)
+        }
+        checkAnswer(sql("SELECT * from maxBytesPerTriggerTest"), (0 until 20).map(_.toString).toDF)
+      } finally {
+        q.stop()
+      }
+    }
+  }
+
+  test("maxBytesPerTrigger: change and restart") {
+    withTempDirs { (inputDir, outputDir, checkpointDir) =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      (0 until 10).foreach { i =>
+        val v = Seq(i.toString).toDF()
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "1b")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("delta")
+        .option("checkpointLocation", checkpointDir.getCanonicalPath)
+        .start(outputDir.getCanonicalPath)
+      try {
+        q.processAllAvailable()
+        val progress = q.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 10)
+        progress.foreach { p =>
+          assert(p.numInputRows === 1)
+        }
+        checkAnswer(
+          spark.read.format("delta").load(outputDir.getAbsolutePath),
+          (0 until 10).map(_.toString).toDF())
+      } finally {
+        q.stop()
+      }
+
+      (10 until 20).foreach { i =>
+        val v = Seq(i.toString).toDF()
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q2 = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "100g")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("delta")
+        .option("checkpointLocation", checkpointDir.getCanonicalPath)
+        .start(outputDir.getCanonicalPath)
+      try {
+        q2.processAllAvailable()
+        val progress = q2.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 1)
+        progress.foreach { p =>
+          assert(p.numInputRows === 10)
+        }
+
+        checkAnswer(
+          spark.read.format("delta").load(outputDir.getAbsolutePath),
+          (0 until 20).map(_.toString).toDF())
+      } finally {
+        q2.stop()
+      }
+    }
+  }
+
+  testQuietly("maxBytesPerTrigger: invalid parameter") {
+    withTempDir { inputDir =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      withMetadata(deltaLog, StructType.fromDDL("value STRING"))
+
+      Seq(0, -1, "string").foreach { invalidMaxBytesPerTrigger =>
+        val e = intercept[StreamingQueryException] {
+          spark.readStream
+            .format("delta")
+            .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, invalidMaxBytesPerTrigger.toString)
+            .load(inputDir.getCanonicalPath)
+            .writeStream
+            .format("console")
+            .start()
+            .processAllAvailable()
+        }
+        assert(e.getCause.isInstanceOf[IllegalArgumentException])
+        for (msg <- Seq("Invalid", DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "size")) {
+          assert(e.getCause.getMessage.contains(msg))
+        }
+      }
+    }
+  }
+
+  test("maxBytesPerTrigger: max bytes and max files together") {
+    withTempDir { inputDir =>
+      val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
+      (0 until 5).foreach { i =>
+        val v = Seq(i.toString).toDF
+        v.write.mode("append").format("delta").save(deltaLog.dataPath.toString)
+      }
+
+      val q = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION, "1") // should process a file at a time
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "100gb")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("memory")
+        .queryName("maxBytesPerTriggerTest")
+        .start()
+      try {
+        q.processAllAvailable()
+        val progress = q.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 5)
+        progress.foreach { p =>
+          assert(p.numInputRows === 1)
+        }
+        checkAnswer(sql("SELECT * from maxBytesPerTriggerTest"), (0 until 5).map(_.toString).toDF)
+      } finally {
+        q.stop()
+      }
+
+      val q2 = spark.readStream
+        .format("delta")
+        .option(DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION, "2")
+        .option(DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION, "1b")
+        .load(inputDir.getCanonicalPath)
+        .writeStream
+        .format("memory")
+        .queryName("maxBytesPerTriggerTest")
+        .start()
+      try {
+        q2.processAllAvailable()
+        val progress = q2.recentProgress.filter(_.numInputRows != 0)
+        assert(progress.length === 5)
+        progress.foreach { p =>
+          assert(p.numInputRows === 1)
+        }
+        checkAnswer(sql("SELECT * from maxBytesPerTriggerTest"), (0 until 5).map(_.toString).toDF)
+      } finally {
+        q2.stop()
+      }
+    }
+  }
+
   test("unknown sourceVersion value") {
     val json =
       s"""
@@ -405,10 +610,12 @@ class DeltaSourceSuite extends StreamTest {
         AssertOnQuery { q => q.processAllAvailable(); true },
         CheckAnswer("keep1", "keep2"),
         StopStream,
-        AssertOnQuery { q =>
+        AssertOnQuery { _ =>
           Utils.deleteRecursively(inputDir)
           val deltaLog = DeltaLog.forTable(spark, new Path(inputDir.toURI))
-          withMetadata(deltaLog, StructType.fromDDL("value STRING"))
+          // All Delta tables in tests use the same tableId by default. Here we pass a new tableId
+          // to simulate a new table creation in production
+          withMetadata(deltaLog, StructType.fromDDL("value STRING"), tableId = Some("tableId-1234"))
           true
         },
         StartStream(),
@@ -602,9 +809,10 @@ class DeltaSourceSuite extends StreamTest {
         AdvanceManualClock(10 * 1000L),
         CheckLastBatch("0", "1", "2"),
         Assert {
-          clock.advance(
-            CalendarInterval.fromString(
-              DeltaConfigs.LOG_RETENTION.defaultValue).milliseconds() + 100000000L)
+          val defaultLogRetentionMillis = DeltaConfigs.getMilliSeconds(
+            IntervalUtils.safeStringToInterval(
+              UTF8String.fromString(DeltaConfigs.LOG_RETENTION.defaultValue)))
+          clock.advance(defaultLogRetentionMillis + 100000000L)
 
           // Delete all logs before checkpoint
           writersLog.cleanUpExpiredLogs()
@@ -653,7 +861,7 @@ class DeltaSourceSuite extends StreamTest {
 
       // Make sure OffsetSeqLog won't choke on the offset we wrote
       withTempDir { logPath =>
-        val seqLog = new OffsetSeqLog(spark, logPath.toString) {
+        new OffsetSeqLog(spark, logPath.toString) {
           val offsetSeq = this.deserialize(new FileInputStream(offsetFile))
           val out = new OutputStream() { override def write(b: Int): Unit = { } }
           this.serialize(offsetSeq, out)
@@ -661,6 +869,98 @@ class DeltaSourceSuite extends StreamTest {
       }
 
       stream.stop()
+    }
+  }
+
+  test("Delta source advances with non-data inserts") {
+    withTempDirs { (inputDir, outputDir, checkpointDir) =>
+      Seq(1L, 2L, 3L).toDF("x").write.format("delta").save(inputDir.toString)
+
+      val df = spark.readStream.format("delta").load(inputDir.toString)
+      val stream = df.writeStream
+        .format("delta")
+        .option("checkpointLocation", checkpointDir.toString)
+        .start(outputDir.toString)
+      try {
+        stream.processAllAvailable()
+
+        val deltaLog = DeltaLog.forTable(spark, inputDir.toString)
+        for(i <- 1 to 3) {
+          deltaLog.startTransaction().commit(Seq(), DeltaOperations.ManualUpdate)
+          stream.processAllAvailable()
+        }
+
+        val fs = deltaLog.dataPath.getFileSystem(spark.sessionState.newHadoopConf())
+        for (version <- 0 to 3) {
+          val possibleFiles = Seq(
+            f"/$version%020d.checkpoint.parquet",
+            f"/$version%020d.json",
+            f"/$version%020d.crc"
+          ).map { name => new Path(inputDir.toString + "/_delta_log" + name) }
+          for (logFilePath <- possibleFiles) {
+            if (fs.exists(logFilePath)) {
+              // The cleanup logic has an edge case when files for higher versions don't have higher
+              // timestamps, so we set the timestamp to scale with version rather than just being 0.
+              fs.setTimes(logFilePath, version * 1000, 0)
+            }
+          }
+        }
+        deltaLog.cleanUpExpiredLogs()
+        stream.processAllAvailable()
+
+        val lastOffset = DeltaSourceOffset(
+          deltaLog.tableId,
+          SerializedOffset(stream.lastProgress.sources.head.endOffset))
+
+        assert(lastOffset == DeltaSourceOffset(1, deltaLog.tableId, 3, -1, false))
+      } finally {
+        stream.stop()
+      }
+    }
+  }
+
+  test("Rate limited Delta source advances with non-data inserts") {
+    withTempDirs { (inputDir, outputDir, checkpointDir) =>
+      Seq(1L, 2L, 3L).toDF("x").write.format("delta").save(inputDir.toString)
+
+      val df = spark.readStream.format("delta").load(inputDir.toString)
+      val stream = df.writeStream
+        .format("delta")
+        .option("checkpointLocation", checkpointDir.toString)
+        .option("maxFilesPerTrigger", 2)
+        .start(outputDir.toString)
+      try {
+        val deltaLog = DeltaLog.forTable(spark, inputDir.toString)
+        for(i <- 1 to 3) {
+          deltaLog.startTransaction().commit(Seq(), DeltaOperations.ManualUpdate)
+        }
+
+        val fs = deltaLog.dataPath.getFileSystem(spark.sessionState.newHadoopConf())
+        for (version <- 0 to 3) {
+          val possibleFiles = Seq(
+            f"/$version%020d.checkpoint.parquet",
+            f"/$version%020d.json",
+            f"/$version%020d.crc"
+          ).map { name => new Path(inputDir.toString + "/_delta_log" + name) }
+          for (logFilePath <- possibleFiles) {
+            if (fs.exists(logFilePath)) {
+              // The cleanup logic has an edge case when files for higher versions don't have higher
+              // timestamps, so we set the timestamp to scale with version rather than just being 0.
+              fs.setTimes(logFilePath, version * 1000, 0)
+            }
+          }
+        }
+        deltaLog.cleanUpExpiredLogs()
+        stream.processAllAvailable()
+
+        val lastOffset = DeltaSourceOffset(
+          deltaLog.tableId,
+          SerializedOffset(stream.lastProgress.sources.head.endOffset))
+
+        assert(lastOffset == DeltaSourceOffset(1, deltaLog.tableId, 3, -1, false))
+      } finally {
+        stream.stop()
+      }
     }
   }
 
@@ -710,7 +1010,7 @@ class MonotonicallyIncreasingTimestampFS extends RawLocalFileSystem {
   override def getFileStatus(f: Path): FileStatus = {
     val original = super.getFileStatus(f)
     time += 1000L
-    new FileStatus(original.getLen, original.isDir, 0, 0, time, f)
+    new FileStatus(original.getLen, original.isDirectory, 0, 0, time, f)
   }
 }
 

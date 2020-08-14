@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,17 +25,18 @@ import scala.concurrent.duration._
 import scala.language.implicitConversions
 
 import org.apache.spark.sql.delta.DeltaHistoryManager.BufferingLogDeletionIterator
+import org.apache.spark.sql.delta.DeltaTestUtils.OptimisticTxnTestHelper
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.util.FileNames
 import org.apache.commons.lang3.time.DateUtils
 import org.apache.hadoop.fs.{FileStatus, Path}
 
 import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
 import org.apache.spark.util.ManualClock
 
 class DeltaTimeTravelSuite extends QueryTest
-  with SharedSQLContext {
+  with SharedSparkSession  with SQLTestUtils {
 
   import testImplicits._
 
@@ -56,12 +57,17 @@ class DeltaTimeTravelSuite extends QueryTest
     }
   }
 
+  private def modifyCheckpointTimestamp(deltaLog: DeltaLog, version: Long, ts: Long): Unit = {
+    val file = new File(FileNames.checkpointFileSingular(deltaLog.logPath, version).toUri)
+    file.setLastModified(ts)
+  }
+
   /** Generate commits with the given timestamp in millis. */
   private def generateCommitsCheap(deltaLog: DeltaLog, commits: Long*): Unit = {
     var startVersion = deltaLog.snapshot.version + 1
     commits.foreach { ts =>
       val action = AddFile(startVersion.toString, Map.empty, 10L, startVersion, dataChange = true)
-      deltaLog.startTransaction().commit(Seq(action), DeltaOperations.ManualUpdate)
+      deltaLog.startTransaction().commitManually(action)
       modifyCommitTimestamp(deltaLog, startVersion, ts)
       startVersion += 1
     }
@@ -144,10 +150,10 @@ class DeltaTimeTravelSuite extends QueryTest
     val history = new DeltaHistoryManager(deltaLog)
     assert(history.getActiveCommitAtTime(start + 15.seconds, false).version === 1)
 
-    assert(new File(FileNames.deltaFile(deltaLog.logPath, 0L).toUri).delete())
     val commits2 = history.getHistory(Some(10))
-    assert(commits2.last.version === Some(1))
+    assert(commits2.last.version === Some(0))
 
+    assert(new File(FileNames.deltaFile(deltaLog.logPath, 0L).toUri).delete())
     val e = intercept[AnalysisException] {
       history.getActiveCommitAtTime(start + 15.seconds, false).version
     }
@@ -195,9 +201,11 @@ class DeltaTimeTravelSuite extends QueryTest
 
       // we need this checkpoint so that we can delete starting with the first version
       deltaLog.checkpoint()
+      modifyCheckpointTimestamp(deltaLog, deltaLog.snapshot.version, time)
       generateCommitsCheap(deltaLog, Seq(5, 10, 7, 8, 14).map(time + _.seconds): _*)
       // We need this checkpoint so that we can delete up to the last version
       deltaLog.checkpoint()
+      modifyCheckpointTimestamp(deltaLog, deltaLog.snapshot.version, time + 14.seconds)
 
       assert(deltaLog.history.getHistory(0, None).map(_.timestamp.getTime).reverse ===
         Seq(time, time + 5.seconds,
@@ -473,7 +481,7 @@ class DeltaTimeTravelSuite extends QueryTest
       val ts = getSparkFormattedTimestamps(start, start + 20.minutes)
 
       checkAnswer(
-        spark.read.format("delta").option("timestampAsOf", ts(0)).load(tblLoc).groupBy().count(),
+        spark.read.format("delta").option("timestampAsOf", ts.head).load(tblLoc).groupBy().count(),
         Row(10L)
       )
 
@@ -505,7 +513,7 @@ class DeltaTimeTravelSuite extends QueryTest
       val ts = getSparkFormattedTimestamps(start + 10.minutes)
 
       val e1 = intercept[AnalysisException] {
-        spark.read.format("delta").option("timestampAsOf", ts(0)).load(tblLoc).collect()
+        spark.read.format("delta").option("timestampAsOf", ts.head).load(tblLoc).collect()
       }
       assert(e1.getMessage.contains("VERSION AS OF 0"))
       assert(e1.getMessage.contains("TIMESTAMP AS OF '2018-10-24 14:14:18'"))
@@ -568,7 +576,7 @@ class DeltaTimeTravelSuite extends QueryTest
         start, start + 1.milli, start + 119.seconds, start - 3.seconds)
 
       checkAnswer(
-        spark.read.option("timestampAsOf", ts(0)).format("delta").load(tblLoc).groupBy().count(),
+        spark.read.option("timestampAsOf", ts.head).format("delta").load(tblLoc).groupBy().count(),
         Row(10L)
       )
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,15 +18,16 @@ package org.apache.spark.sql.delta
 
 import java.util.Locale
 
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import io.delta.tables._
 
 import org.apache.spark.sql._
 import org.apache.spark.sql.types.StructType
 
-class MergeIntoScalaSuite extends MergeIntoSuiteBase {
+class MergeIntoScalaSuite extends MergeIntoSuiteBase  with DeltaSQLCommandTest {
 
   import testImplicits._
-
 
   test("basic scala API") {
     withTable("source") {
@@ -117,6 +118,29 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
     }
   }
 
+  test("updateAll and insertAll with columns containing dot") {
+    withTable("source") {
+      append(Seq((1, 10), (2, 20), (4, 40)).toDF("key", "the.value"), Nil) // target
+      val source = Seq((1, 100), (3, 30), (4, 41)).toDF("key", "the.value") // source
+
+      io.delta.tables.DeltaTable.forPath(spark, tempPath).as("t")
+        .merge(source.as("s"), "t.key = s.key")
+        .whenMatched()
+        .updateAll()
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+
+      checkAnswer(
+        readDeltaTable(tempPath),
+        Row(1, 100) :: // Update
+          Row(2, 20) :: // No change
+          Row(4, 41) :: // Update
+          Row(3, 30) :: // Insert
+          Nil)
+    }
+  }
+
   test("update with empty map should do nothing") {
     append(Seq((1, 10), (2, 20)).toDF("trgKey", "trgValue"), Nil) // target
     val source = Seq((1, 100), (3, 30)).toDF("srcKey", "srcValue") // source
@@ -148,19 +172,6 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
       Nil)              // Deleted (3, 30)
   }
 
-  test("insert with empty map throws error") {
-    append(Seq((1, 10), (2, 20)).toDF("trgKey", "trgValue"), Nil) // target
-    val source = Seq((1, 100), (3, 30)).toDF("srcKey", "srcValue") // source
-    val e = intercept[AnalysisException] {
-      io.delta.tables.DeltaTable.forPath(spark, tempPath)
-        .merge(source, "srcKey = trgKey")
-        .whenMatched().updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-        .whenNotMatched().insertExpr(Map[String, String]())
-        .execute()
-    }
-    errorContains(e.getMessage, "INSERT clause must specify value for all the columns")
-  }
-
   // Checks specific to the APIs that are automatically handled by parser for SQL
   test("check invalid merge API calls") {
     withTable("source") {
@@ -173,9 +184,9 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
           .merge(source, "srcKey = trgKey")
           .execute()
       }
-      errorContains(e.getMessage, "There must be at least one WHEN clause in a MERGE query")
+      errorContains(e.getMessage, "There must be at least one WHEN clause in a MERGE statement")
 
-      // When there are 2 MATCHED clauses in a MERGE statement,
+      // When there are multiple MATCHED clauses in a MERGE statement,
       // the first MATCHED clause must have a condition
       e = intercept[AnalysisException] {
         io.delta.tables.DeltaTable.forPath(spark, tempPath)
@@ -185,56 +196,8 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
           .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
           .execute()
       }
-      errorContains(e.getMessage, "the first MATCHED clause must have a condition")
-
-      // There must be at most two WHEN clauses in a MERGE statement
-      e = intercept[AnalysisException] {
-        io.delta.tables.DeltaTable.forPath(spark, tempPath)
-          .merge(source, "srcKey = trgKey")
-          .whenMatched("trgKey = 1").updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .whenMatched("trgValue = 3").delete()
-          .whenMatched("trgValue = 2")
-          .updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue + 1"))
-          .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .execute()
-      }
-      errorContains(e.getMessage, "There must be at most two match clauses in a MERGE query")
-
-      // INSERT can appear at most once in NOT MATCHED clauses in a MERGE statement
-      e = intercept[AnalysisException] {
-        io.delta.tables.DeltaTable.forPath(spark, tempPath)
-          .merge(source, "srcKey = trgKey")
-          .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey + 1", "trgValue" -> "srcValue"))
-          .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .execute()
-      }
-      errorContains(e.getMessage,
-        "INSERT, UPDATE and DELETE cannot appear twice in one MERGE query")
-
-      // UPDATE can appear at most once in MATCHED clauses in a MERGE statement
-      e = intercept[AnalysisException] {
-        io.delta.tables.DeltaTable.forPath(spark, tempPath)
-          .merge(source, "srcKey = trgKey")
-          .whenMatched("trgKey = 1").updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .whenMatched("trgValue = 2")
-          .updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue + 1"))
-          .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .execute()
-      }
-      errorContains(e.getMessage,
-        "INSERT, UPDATE and DELETE cannot appear twice in one MERGE query")
-
-      // DELETE can appear at most once in MATCHED clauses in a MERGE statement
-      e = intercept[AnalysisException] {
-        io.delta.tables.DeltaTable.forPath(spark, tempPath)
-          .merge(source, "srcKey = trgKey")
-          .whenMatched("trgKey = 1").delete()
-          .whenMatched("trgValue = 2").delete()
-          .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
-          .execute()
-      }
-      errorContains(e.getMessage,
-        "INSERT, UPDATE and DELETE cannot appear twice in one MERGE query")
+      errorContains(e.getMessage, "When there are more than one MATCHED clauses in a MERGE " +
+        "statement, only the last MATCHED clause can omit the condition.")
 
       e = intercept[AnalysisException] {
         io.delta.tables.DeltaTable.forPath(spark, tempPath)
@@ -254,6 +217,91 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
       }
       errorContains(e.getMessage, "cannot resolve `*`")
     }
+  }
+
+  test("merge after schema change") {
+    withSQLConf((DeltaSQLConf.DELTA_SCHEMA_AUTO_MIGRATE.key, "true")) {
+      withTempPath { targetDir =>
+        val targetPath = targetDir.getCanonicalPath
+        spark.range(10).write.format("delta").save(targetPath)
+        val t = io.delta.tables.DeltaTable.forPath(spark, targetPath).as("t")
+        assert(t.toDF.schema == StructType.fromDDL("id LONG"))
+
+        // Do one merge to change the schema.
+        t.merge(Seq((11L, "newVal11")).toDF("id", "newCol1").as("s"), "t.id = s.id")
+          .whenMatched().updateAll()
+          .whenNotMatched().insertAll()
+          .execute()
+        // assert(t.toDF.schema == StructType.fromDDL("id LONG, newCol1 STRING"))
+
+        // SC-35564 - ideally this shouldn't throw an error, but right now we can't fix it without
+        // causing a regression.
+        val ex = intercept[Exception] {
+          t.merge(Seq((12L, "newVal12")).toDF("id", "newCol2").as("s"), "t.id = s.id")
+            .whenMatched().updateAll()
+            .whenNotMatched().insertAll()
+            .execute()
+        }
+        ex.getMessage.contains("schema of your Delta table has changed in an incompatible way")
+      }
+    }
+  }
+
+  test("merge without table alias") {
+    withTempDir { dir =>
+      val location = dir.getAbsolutePath
+      Seq((1, 1, 1), (2, 2, 2)).toDF("part", "id", "n").write
+        .format("delta")
+        .partitionBy("part")
+        .save(location)
+      val table = io.delta.tables.DeltaTable.forPath(spark, location)
+      val data1 = Seq((2, 2, 4, 2), (9, 3, 6, 9), (3, 3, 9, 3)).toDF("part", "id", "n", "part2")
+      table.alias("t").merge(
+        data1,
+        "t.part = part2")
+        .whenMatched().updateAll()
+        .whenNotMatched().insertAll()
+        .execute()
+    }
+  }
+
+  test("merge without table alias with pre-computed condition") {
+    withTempDir { dir =>
+      val location = dir.getAbsolutePath
+      Seq((1, 1, 1), (2, 2, 2)).toDF("part", "id", "x").write
+        .format("delta")
+        .partitionBy("part")
+        .save(location)
+      val table = io.delta.tables.DeltaTable.forPath(spark, location)
+      val tableDf = table.toDF
+      val data1 = Seq((2, 2, 4), (2, 3, 6), (3, 3, 9)).toDF("part", "id", "x")
+      table.merge(
+        data1,
+        tableDf("part") === data1("part") && tableDf("id") === data1("id"))
+        .whenMatched().updateAll()
+        .whenNotMatched().insertAll()
+        .execute()
+    }
+  }
+
+  test("merge clause matched and not matched can interleave") {
+    append(Seq((1, 10), (2, 20)).toDF("trgKey", "trgValue"), Nil) // target
+    val source = Seq((1, 100), (2, 200), (3, 300), (4, 400)).toDF("srcKey", "srcValue") // source
+    io.delta.tables.DeltaTable.forPath(spark, tempPath)
+      .merge(source, "srcKey = trgKey")
+      .whenMatched("trgKey = 1").updateExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
+      .whenNotMatched("srcKey = 3").insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
+      .whenMatched().delete()
+      .whenNotMatched().insertExpr(Map("trgKey" -> "srcKey", "trgValue" -> "srcValue"))
+      .execute()
+
+    checkAnswer(
+      readDeltaTable(tempPath),
+      Row(1, 100) ::  // Update (1, 10)
+                      // Delete (2, 20)
+      Row(3, 300) ::  // Insert (3, 300)
+      Row(4, 400) ::  // Insert (4, 400)
+      Nil)
   }
 
   override protected def executeMerge(
@@ -277,13 +325,19 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
       cond: String,
       clauses: MergeClause*): Unit = {
 
-    def parse(tableNameWithAlias: String): (String, Option[String]) = {
+    def parseTableAndAlias(tableNameWithAlias: String): (String, Option[String]) = {
       tableNameWithAlias.split(" ").toList match {
-        case tableName :: Nil => tableName -> None
-        case tableName :: alias :: Nil => tableName -> Some(alias)
+        case tableName :: Nil =>
+          // 'MERGE INTO tableName' OR `MERGE INTO delta.`path`'
+          tableName -> None
+        case tableName :: alias :: Nil =>
+          // 'MERGE INTO tableName alias' or 'MERGE INTO delta.`path` alias'
+          tableName -> Some(alias)
         case list if list.size >= 3 && list(list.size - 2).toLowerCase(Locale.ROOT) == "as" =>
+          // 'MERGE INTO ... AS alias'
           list.dropRight(2).mkString(" ").trim() -> Some(list.last)
         case list if list.size >= 2 =>
+          // 'MERGE INTO ... alias'
           list.dropRight(1).mkString(" ").trim() -> Some(list.last)
         case _ =>
           fail(s"Could not build parse '$tableNameWithAlias' for table and optional alias")
@@ -324,14 +378,14 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
     }
 
     val deltaTable = {
-      val (tableNameOrPath, optionalAlias) = parse(tgt)
+      val (tableNameOrPath, optionalAlias) = parseTableAndAlias(tgt)
       var table = makeDeltaTable(tableNameOrPath)
       optionalAlias.foreach { alias => table = table.as(alias) }
       table
     }
 
     val sourceDataFrame: DataFrame = {
-      val (tableOrQuery, optionalAlias) = parse(src)
+      val (tableOrQuery, optionalAlias) = parseTableAndAlias(src)
       var df =
         if (tableOrQuery.startsWith("(")) spark.sql(tableOrQuery) else spark.table(tableOrQuery)
       optionalAlias.foreach { alias => df = df.as(alias) }
@@ -400,7 +454,7 @@ class MergeIntoScalaSuite extends MergeIntoSuiteBase {
       val path = nameOrPath.stripPrefix("delta.`").stripSuffix("`")
       io.delta.tables.DeltaTable.forPath(spark, path)
     } else {
-      io.delta.tables.DeltaTable(spark.table(nameOrPath))
+      DeltaTableTestUtils.createTable(spark.table(nameOrPath), DeltaLog.forTable(spark, nameOrPath))
     }
   }
 

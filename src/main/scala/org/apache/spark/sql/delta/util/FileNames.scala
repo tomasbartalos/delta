@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,8 @@
 
 package org.apache.spark.sql.delta.util
 
-import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.delta.DeltaErrors
+import org.apache.hadoop.fs.{FileStatus, Path}
 
 /** Helper for creating file names for specific commits / checkpoints. */
 object FileNames {
@@ -84,4 +85,25 @@ object FileNames {
   def isChecksumFile(path: Path): Boolean = checksumFilePattern.matcher(path.getName).matches()
 
   def checkpointVersion(path: Path): Long = path.getName.split("\\.")(0).toLong
+
+  /**
+   * Get the version of the checkpoint, checksum or delta file. Throws an error if an unexpected
+   * file type is seen. These unexpected files should be filtered out to ensure forward
+   * compatibility in cases where new file types are added, but without an explicit protocol
+   * upgrade.
+   */
+  def getFileVersion(path: Path): Long = {
+    if (isCheckpointFile(path)) {
+      checkpointVersion(path)
+    } else if (isDeltaFile(path)) {
+      deltaVersion(path)
+    } else if (isChecksumFile(path)) {
+      checksumVersion(path)
+    } else {
+      // scalastyle:off throwerror
+      throw new AssertionError(
+        s"Unexpected file type found in transaction log: $path")
+      // scalastyle:on throwerror
+    }
+  }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,10 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql.catalyst.plans.logical
+package org.apache.spark.sql.delta
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
+import org.apache.spark.sql.delta.test.DeltaHiveTest
 
-/**
- * Perform DELETE on a table, in which all the rows are deleted if and only the condition is true
- *
- * @param child the logical plan representing target table
- * @param condition: Only rows that match the condition will be deleted.
- */
-case class Delete(
-    child: LogicalPlan,
-    condition: Option[Expression])
-  extends UnaryNode {
-  override def output: Seq[Attribute] = Seq.empty
-}
+import org.apache.spark.sql.hive.test.TestHiveSingleton
+
+class HiveDeltaNotSupportedDDLSuite extends DeltaNotSupportedDDLBase with DeltaHiveTest

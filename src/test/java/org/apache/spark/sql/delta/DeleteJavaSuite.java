@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package test.com.databricks.sql.transaction.tahoe;
+package org.apache.spark.sql.delta;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,23 +24,20 @@ import scala.Tuple2;
 
 import io.delta.tables.DeltaTable;
 import org.junit.After;
-import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
 import org.apache.spark.sql.*;
-import org.apache.spark.sql.test.TestSparkSession;
 import org.apache.spark.util.Utils;
 
-public class DeleteJavaSuite {
+public class DeleteJavaSuite implements DeltaSQLCommandJavaTest {
 
-    private transient TestSparkSession spark;
+    private transient SparkSession spark;
     private transient String tempPath;
 
     @Before
     public void setUp() {
-        spark = new TestSparkSession();
+        spark = buildSparkSession();
         tempPath = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "spark").toString();
     }
 
@@ -63,8 +60,7 @@ public class DeleteJavaSuite {
         target.delete();
 
         List<Row> expectedAnswer = new ArrayList<>();
-        String testresult = QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
-        Assert.assertNull(testresult);
+        QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
     }
 
     @Test
@@ -79,8 +75,7 @@ public class DeleteJavaSuite {
 
         List<Row> expectedAnswer = createKVDataSet(
             Arrays.asList(tuple2(3, 30), tuple2(4, 40))).collectAsList();
-        String testresult = QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
-        Assert.assertNull(testresult);
+        QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
     }
 
     @Test
@@ -95,8 +90,7 @@ public class DeleteJavaSuite {
 
         List<Row> expectedAnswer = createKVDataSet(
             Arrays.asList(tuple2(3, 30), tuple2(4, 40))).collectAsList();
-        String testresult = QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
-        Assert.assertNull(testresult);
+        QueryTest$.MODULE$.checkAnswer(target.toDF(), expectedAnswer);
     }
 
     private Dataset<Row> createKVDataSet(

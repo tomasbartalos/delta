@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,11 +23,11 @@ import org.apache.hadoop.fs.Path
 import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row}
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.Utils
 
 abstract class DeleteSuiteBase extends QueryTest
-  with SharedSQLContext with BeforeAndAfterEach {
+  with SharedSparkSession with BeforeAndAfterEach {
 
   import testImplicits._
 
@@ -40,7 +40,6 @@ abstract class DeleteSuiteBase extends QueryTest
   protected def readDeltaTable(path: String): DataFrame = {
     spark.read.format("delta").load(path)
   }
-
 
   override def beforeEach() {
     super.beforeEach()
@@ -85,7 +84,7 @@ abstract class DeleteSuiteBase extends QueryTest
   }
 
   Seq(true, false).foreach { isPartitioned =>
-    test(s"basic case - delete from a Delta table - Partition=$isPartitioned") {
+    test(s"basic case - delete from a Delta table by path - Partition=$isPartitioned") {
       withTable("deltaTable") {
         val partitions = if (isPartitioned) "key" :: Nil else Nil
         val input = Seq((2, 2), (1, 4), (1, 1), (0, 3)).toDF("key", "value")
@@ -98,6 +97,37 @@ abstract class DeleteSuiteBase extends QueryTest
         checkDelete(Some("value = 2 or key = 1"),
           Row(0, 3) :: Nil)
         checkDelete(Some("key = 0 or value = 99"), Nil)
+      }
+    }
+  }
+
+  Seq(true, false).foreach { isPartitioned =>
+    test(s"basic case - delete from a Delta table by name - Partition=$isPartitioned") {
+      withTable("delta_table") {
+        val partitionByClause = if (isPartitioned) "PARTITIONED BY (key)" else ""
+        sql(
+          s"""
+             |CREATE TABLE delta_table(key INT, value INT)
+             |USING delta
+             |OPTIONS('path'='$tempPath')
+             |$partitionByClause
+           """.stripMargin)
+
+        val input = Seq((2, 2), (1, 4), (1, 1), (0, 3)).toDF("key", "value")
+        append(input)
+
+        checkDelete(Some("value = 4 and key = 3"),
+          Row(2, 2) :: Row(1, 4) :: Row(1, 1) :: Row(0, 3) :: Nil,
+          Some("delta_table"))
+        checkDelete(Some("value = 4 and key = 1"),
+          Row(2, 2) :: Row(1, 1) :: Row(0, 3) :: Nil,
+          Some("delta_table"))
+        checkDelete(Some("value = 2 or key = 1"),
+          Row(0, 3) :: Nil,
+          Some("delta_table"))
+        checkDelete(Some("key = 0 or value = 99"),
+          Nil,
+          Some("delta_table"))
       }
     }
   }
@@ -189,7 +219,27 @@ abstract class DeleteSuiteBase extends QueryTest
     assert(e.contains("nondeterministic expressions are only allowed in"))
   }
 
-  test("delete cached table") {
+  test("Negative case - DELETE the child directory") {
+    append(Seq((2, 2), (3, 2)).toDF("key", "value"), partitionBy = "key" :: Nil)
+    val e = intercept[AnalysisException] {
+      executeDelete(target = s"delta.`$tempPath/key=2`", where = "value = 2")
+    }.getMessage
+    assert(e.contains("Expect a full scan of Delta sources, but found a partial scan"))
+  }
+
+  test("delete cached table by name") {
+    withTable("cached_delta_table") {
+      Seq((2, 2), (1, 4)).toDF("key", "value")
+        .write.format("delta").saveAsTable("cached_delta_table")
+
+      spark.table("cached_delta_table").cache()
+      spark.table("cached_delta_table").collect()
+      executeDelete(target = "cached_delta_table", where = "key = 2")
+      checkAnswer(spark.table("cached_delta_table"), Row(1, 4) :: Nil)
+    }
+  }
+
+  test("delete cached table by path") {
     Seq((2, 2), (1, 4)).toDF("key", "value")
       .write.mode("overwrite").format("delta").save(tempPath)
     spark.read.format("delta").load(tempPath).cache()
